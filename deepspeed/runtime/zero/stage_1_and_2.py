@@ -4,6 +4,8 @@
 # DeepSpeed Team
 
 import torch
+import copy
+import threading
 from deepspeed import comm as dist
 from packaging import version as pkg_version
 from collections import OrderedDict
@@ -136,7 +138,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                  round_robin_gradients=False,
                  has_moe_layers=False,
                  fp16_master_weights_and_gradients=False,
-                 elastic_checkpoint=False):
+                 elastic_checkpoint=False,
+                 vertin_cpu_optimizer = None):
 
         if offload_optimizer_config is not None and offload_optimizer_config.device != OffloadDeviceEnum.none:
             self.cpu_offload = True
@@ -551,6 +554,25 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         self._enable_universal_checkpoint()
         self._param_slice_mappings = self._create_param_mapping()
+
+        #TODO vertin
+        self.vertin_FLAG = False
+        self.vertin_step = 0
+
+        self.vertin_stream = None if get_accelerator().is_synchronized_device() else get_accelerator().Stream()
+
+        self.vertin_optimizer = vertin_cpu_optimizer
+        self.vertin_Create_FLAG = False
+        self.vertin_param_groups = []
+
+        self.vertin_thread = None
+        # self.vertin_process = None
+
+        self.vertin_update_FLAG = False
+
+        self.grad_position = {}
+        for i, param_group in enumerate(self.bit16_groups):
+            self.get_grad_position(i, self.params_in_partition[i], self.first_offset[i], self.partition_size[i])
 
     def destroy(self):
         for i, _ in enumerate(self.optimizer.param_groups):
@@ -1276,6 +1298,24 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         dest_tensor.copy_(src_tensor, non_blocking=True)
         param.grad = None  #offload only
 
+    #TODO vertin 
+    def vertin_async_inplace_copy_grad_to_fp32_buffer_from_gpu(self, param):
+        param_id = self.get_param_id(param)
+
+        [i, source_offset, dest_offset, num_elements] = self.grad_position[param_id]
+
+        dest_tensor = self.vertin_param_groups[i].grad.view(-1).narrow(0, dest_offset, num_elements)
+
+        grad_accum = self.get_param_gradient_attribute(param)
+        if grad_accum is None:
+            src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
+        else:
+            src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
+        if not self.fp16_master_weights_and_gradients:
+            src_tensor = src_tensor.float()
+
+        dest_tensor.copy_(src_tensor, non_blocking=True)
+
     def complete_grad_norm_calculation_for_cpu_offload(self, params):
         total_norm = 0.0
         norm_type = 2.0
@@ -1333,6 +1373,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 self.async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
 
             return
+        
+        #TODO vertin grad transformer
+        if self.vertin_Create_FLAG:
+            stream = self.vertin_stream
+            with get_accelerator().stream(stream):
+                self.vertin_async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
+
         #print(f"ID {self.get_param_id(param)} grad norm {param.grad.norm()}")
         if self.grads_in_partition is None:
             self.grads_in_partition_offset = 0
@@ -1798,7 +1845,50 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         bit16_partitions = self.parallel_partitioned_bit16_groups[group_no]
         partition_id = dist.get_rank(group=self.real_dp_process_group[group_no])
         return [bit16_partitions[dist.get_rank(group=self.real_dp_process_group[group_no])]]
+    
+    #TODO vertin
+    def _vertin_create_param_groups(self, param_groups):
+        
+        self.vertin_Create_FLAG = True
+        vertin_param_groups = copy.deepcopy(param_groups)
+        for group in vertin_param_groups:
+            group['params'] = [param.datach().clone.cpu() for param in group['params']]
+            if 'bias_correction' not in group:
+                group['bias_correction'] = True
+        self.vertin_param_groups = vertin_param_groups
+        self.vertin_optimizer.param_groups = self.vertin_param_groups
 
+        for i, group in enumerate(self.bit16_groups)
+            single_grad_partition = torch.zeros(int(self.partition_size[i]),
+                                                    dtype = self.single_partition_of_fp32_groups[i].dtype,
+                                                    device = 'cpu')
+            self.vertin_param_groups[i]['params'][0].grad = get_accelerator().pin_memory(single_grad_partition)
+
+    #TODO veritn
+    def _vertin_step(self, group_no):
+        original_param_groups = self.vertin_optimizer.param_groups
+        self.vertin_optimizer.param_groups = [original_param_groups[group_no]]
+
+        self.vertin_optimizer.step()
+
+        self.vertin_optimizer.param_groups = original_param_groups
+
+    #TODO vertin use the vertin optimizer replace the gpu optimizer
+    def vertin_update(self, group_no):
+        vertin_state = self.vertin_optimizer.state
+        basic_state = self.optimizer.state
+
+        basic_key = list(basic_state.key())[group_no]
+        vertin_key = list(vertin_state.key())[1-group_no]
+
+        basic_value = basic_state[basic_key]
+        vertin_value = vertin_state[vertin_key]
+
+        basic_value['exp_avg_sq'].copy(vertin_value['exp_avg_sq'].to(basic_value['exp_avg_sq'].device))
+
+        basic_value['exp_avg'].copy(vertin_value['exp_avg'].to(basic_value['exp_avg'].device))
+
+    # TODO vertin add vertin update to code
     def _optimizer_step(self, group_no):
         original_param_groups = self.optimizer.param_groups
         self.optimizer.param_groups = [original_param_groups[group_no]]
@@ -1808,6 +1898,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         #    self.optimizer.step(fp16_param_groups=[self.get_bit16_param_group(group_no)])
         #else:
         #    self.optimizer.step()
+
+        if not self.vertin_Create_FLAG:
+            self._vertin_create_param_groups(original_param_groups)
+        else:
+            self.vertin_thread = threading.Thread(target=self._vertin_step, args=(group_no,))
+            self.vertin_thread.start()
+
+
         self.optimizer.step()
         self.optimizer.param_groups = original_param_groups
 

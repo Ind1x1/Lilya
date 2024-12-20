@@ -196,7 +196,8 @@ class DeepSpeedEngine(Module):
                  config=None,
                  config_class=None,
                  mesh_device=None,
-                 dont_change_device=False):
+                 dont_change_device=False,
+                 vertin_flag = False):
         super(DeepSpeedEngine, self).__init__()
         self.dont_change_device = dont_change_device
         self.client_optimizer = optimizer
@@ -373,6 +374,10 @@ class DeepSpeedEngine(Module):
         self.unflatten = _unflatten_dense_tensors
 
         self._is_compiled = False
+
+        #TODO vertin
+        self.vertin_optimizer = None
+        self.vertin_flag = vertin_flag
 
     def _optimized_linear_offload_setup(self):
         self.optimized_linear_base_weight_sharding = False
@@ -1276,6 +1281,12 @@ class DeepSpeedEngine(Module):
 
         return None
 
+    #TODO vertin
+    def _configure_vertin_optimizer(self, model_parameters):
+        from deepspeed.ops.vertin import SonnetVertinCPUAdam
+        vertin_optimizer = SonnetVertinCPUAdam(model_parameters)
+        return vertin_optimizer
+
     # Configure optimizer
     def _configure_optimizer(self, client_optimizer, model_parameters):
         if client_optimizer is None:
@@ -1307,7 +1318,12 @@ class DeepSpeedEngine(Module):
         optimizer_wrapper = self._do_optimizer_sanity_check(basic_optimizer)
 
         if optimizer_wrapper == ZERO_OPTIMIZATION:
-            self.optimizer = self._configure_zero_optimizer(basic_optimizer)
+            #TODO vertin
+            if self.vertin_flag == True:
+                vertin_optimizer = self._configure_vertin_optimizer(model_parameters)
+                self.vertin_optimizer = vertin_optimizer
+
+            self.optimizer = self._configure_zero_optimizer(basic_optimizer, vertin_optimizer)
         elif optimizer_wrapper == AMP:
             amp_params = self.amp_params()
             log_dist(f"Initializing AMP with these params: {amp_params}", ranks=[0])
@@ -1537,7 +1553,7 @@ class DeepSpeedEngine(Module):
 
         return optimizer
 
-    def _configure_zero_optimizer(self, optimizer):
+    def _configure_zero_optimizer(self, optimizer, vertin_optimizer = None):
         zero_stage = self.zero_optimization_stage()
 
         mics_shard_size = self.mics_shard_size()
@@ -1565,6 +1581,7 @@ class DeepSpeedEngine(Module):
                 if overlap_comm:
                     logger.warning("Pipeline parallelism does not support overlapped communication, will be disabled.")
                     overlap_comm = False
+            #TODO vertin
             optimizer = DeepSpeedZeroOptimizer(
                 optimizer,
                 self.param_names,
@@ -1594,7 +1611,8 @@ class DeepSpeedEngine(Module):
                 fp16_master_weights_and_gradients=self.fp16_master_weights_and_gradients(),
                 gradient_accumulation_dtype=gradient_accumulation_dtype,
                 communication_data_type=self.communication_data_type,
-                elastic_checkpoint=self.zero_elastic_checkpoint())
+                elastic_checkpoint=self.zero_elastic_checkpoint(),
+                vertin_cpu_optmizer = vertin_optimizer)
 
         elif zero_stage == ZeroStageEnum.weights:
             assert not self.has_moe_layers, "MoE not supported with Stage 3"
