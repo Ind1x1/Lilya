@@ -45,6 +45,11 @@ OPTIMIZER_TIMERS = [OPTIMIZER_ALLGATHER_TIMER, OPTIMIZER_GRADIENTS_TIMER, OPTIMI
 INITIAL_MICRO_STEP_ID = -1
 
 
+import torch.multiprocessing as mp
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+
+
 def input(msg):
     return
 
@@ -568,6 +573,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         self.vertin_thread = None
         # self.vertin_process = None
+
+        self.vertin_pool = ProcessPoolExecutor(1)
+        self.vertin_lock = mp.Lock()
 
         self.vertin_update_FLAG = False
 
@@ -1316,6 +1324,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             src_tensor = src_tensor.float()
 
         dest_tensor.copy_(src_tensor, non_blocking=True)
+        # print(self.vertin_param_groups[i]['params'][0].grad)
         # param.grad = None  #offload only
 
     def complete_grad_norm_calculation_for_cpu_offload(self, params):
@@ -1376,11 +1385,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             return
         
-        #TODO vertin grad transformer
-        if self.vertin_Create_FLAG:
-            stream = self.vertin_stream
-            with get_accelerator().stream(stream):
-                self.vertin_async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
+        
+        # #TODO vertin grad transformer
+        # if self.vertin_Create_FLAG:
+        #     start_time = time.time()
+        #     stream = self.vertin_stream
+        #     with get_accelerator().stream(stream):
+        #         self.vertin_async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
+        #     end_time = time.time()
+        #     logger.info(f"copy time = {end_time-start_time}")
 
         #print(f"ID {self.get_param_id(param)} grad norm {param.grad.norm()}")
         if self.grads_in_partition is None:
@@ -1403,6 +1416,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         grad_reduc.data = new_grad_tensor.data.view_as(grad_reduc)
         #print(f"Grad norm after copy to contiguous_buffer {param.grad.data.norm()}")
         self.grads_in_partition_offset += param.numel()
+
+        if self.vertin_Create_FLAG:
+            stream = self.vertin_stream
+            with get_accelerator().stream(stream):
+                start_time = time.time()
+                self.vertin_async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
+                end_time = time.time()
+                # logger.info(f"copy time = {end_time-start_time}")
 
     def reduce_ipg_grads(self):
         if self.contiguous_gradients:
@@ -1854,17 +1875,20 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.vertin_Create_FLAG = True
         vertin_param_groups = copy.deepcopy(param_groups)
         for group in vertin_param_groups:
-            group['params'] = [param.detach().clone().cpu() for param in group['params']]
+            group['params'] = [param.detach().clone().cpu().share_memory_() for param in group['params']]
             if 'bias_correction' not in group:
                 group['bias_correction'] = True  # 或者设置为默认值 False，依据你训练时的需求
         self.vertin_param_groups = vertin_param_groups
         self.vertin_optimizer.param_groups = self.vertin_param_groups
+        print(self.vertin_optimizer.param_groups)
 
         for i, group in enumerate(self.bit16_groups):
             single_grad_partition = torch.zeros(int(self.partition_size[i]),
                                                     dtype = self.single_partition_of_fp32_groups[i].dtype,
                                                     device = 'cpu')
-            self.vertin_param_groups[i]['params'][0].grad = get_accelerator().pin_memory(single_grad_partition)
+            single_grad_partition.share_memory_()
+            self.vertin_param_groups[i]['params'][0].grad = single_grad_partition
+            print(self.vertin_param_groups[i]['params'][0].grad)
 
     #TODO veritn
     def _vertin_step(self, group_no):
@@ -1907,8 +1931,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if not self.vertin_Create_FLAG:
             self._vertin_create_param_groups(original_param_groups)
         else:
-            self.vertin_thread = threading.Thread(target=self._vertin_step, args=(group_no,))
-            self.vertin_thread.start()
+            self.vertin_pool.submit(self._vertin_step, group_no)
 
 
         self.optimizer.step()

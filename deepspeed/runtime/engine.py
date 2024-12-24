@@ -2262,7 +2262,7 @@ class DeepSpeedEngine(Module):
 
             report_progress = self.global_rank == 0 if self.global_rank else True
 
-        self.tput_timer.stop(global_step=self.is_gradient_accumulation_boundary(), report_speed=report_progress)
+        # self.tput_timer.stop(global_step=self.is_gradient_accumulation_boundary(), report_speed=report_progress)
 
         self._stop_timers(self.engine_timers.step_timers)
 
