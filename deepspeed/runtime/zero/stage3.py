@@ -33,6 +33,9 @@ from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedO
 from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, FP32_FLAT_GROUPS, PARTITION_COUNT, ZERO_STAGE, LOSS_SCALER
 from deepspeed.accelerator import get_accelerator
 
+import torch.multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
+
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without
 pg_correctness_test = False
@@ -158,7 +161,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         zero_quantized_weights=False,
         zero_quantized_nontrainable_weights=False,
         zero_module_granularity_threshold=0,
-    ):
+        vertin_cpu_optimizer = None,
+):
         see_memory_usage("Stage 3 initialize beginning", force=True)
 
         print_rank_0(f"initialized {__class__.__name__} with args: {locals()}", force=False)
@@ -434,6 +438,17 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if dist.get_rank(group=self.dp_process_group) == 0:
             see_memory_usage(f"After initializing ZeRO optimizer", force=True)
 
+        # TODO vertin
+        self.vertin_FLAG = False
+        self.vertin_step = 0
+
+        self.vertin_stream = None if get_accelerator().is_synchronized_device() else get_accelerator().Stream()
+        self.vertin_optimizer = vertin_cpu_optimizer
+        self.vertin_param_groups =[]
+
+        self.vertin_pool = ProcessPoolExecutor(1)
+        self.vertin_look = mp.Lock()
+
     def destroy(self):
         self.parameter_offload.destroy()
         for hook in self._grad_acc_hooks:
@@ -443,6 +458,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         print_rank_0("Removed grad acc hooks", force=False)
         del self.__ipg_bucket_flat_buffer
 
+    # question: from this seemly zero 3 has bind with ds_zero_offload?
     def initialize_ds_offload(
         self,
         module,

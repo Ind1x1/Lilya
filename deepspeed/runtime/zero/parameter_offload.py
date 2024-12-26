@@ -190,6 +190,7 @@ class DeepSpeedZeRoOffload(object):
     def empty_partition_cache(self):
         self.partition_all_parameters()
 
+    # TODO zero3 param process
     def _convert_to_zero_parameters(self, ds_config, module, mpu):
         non_zero_params = [p for p in module.parameters() if not is_zero_param(p)]
         if non_zero_params:

@@ -5,7 +5,6 @@
 
 import torch
 import copy
-import threading
 import time
 from deepspeed import comm as dist
 from packaging import version as pkg_version
@@ -46,7 +45,6 @@ INITIAL_MICRO_STEP_ID = -1
 
 
 import torch.multiprocessing as mp
-import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 
 
@@ -1900,7 +1898,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         self.vertin_optimizer.param_groups = original_param_groups
         step_time = time.time() - start_time
-        logger.info(f"overhead = {step_time}")
+        # logger.info(f"overhead = {step_time}")
 
     #TODO vertin use the vertin optimizer replace the gpu optimizer
     def vertin_update(self, group_no):
