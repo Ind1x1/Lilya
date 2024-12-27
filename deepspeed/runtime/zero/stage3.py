@@ -995,6 +995,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 gpu_loss = self.backup_optimizer.step()
                 self.backup_optimizer.param_groups[param_group_id]['params'] = []
         else:
+            # update
             self.optimizer.param_groups[param_group_id]['params'] = [fp32_param]
             self.optimizer.step()
             self.optimizer.param_groups[param_group_id]['params'] = []
@@ -1305,6 +1306,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         self.params_in_ipg_bucket.append(param)
 
+    #TODO ZeRO-3 import reduce grads 
     @instrument_w_nvtx
     @torch.no_grad()
     def __reduce_and_partition_ipg_grads(self, safe_mode: bool = False) -> None:
@@ -1487,7 +1489,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 # this grad partition is empty - don't need to do anything
                 param.grad = None
                 continue
-
+            
+            # accumlate gradients
             # move or accumulate gradient partition to target buffer
             grad_buffer = self.__param_id_to_grad_partition[param.ds_id].narrow(0, 0, grad_partition.numel())
             buffers.append(grad_buffer)

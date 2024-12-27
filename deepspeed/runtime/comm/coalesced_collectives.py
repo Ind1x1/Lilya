@@ -43,7 +43,7 @@ def all_to_all_quant_reduce(tensors: List[Tensor], groups: {}) -> List[Tensor]:
         if tensor.dim() == 1:
             output_lst[idx] = reduce_scatter_coalesced([tensor])[0]
         elif tensor.numel() % (2 * global_world_size) != 0:
-            # Due to the constraint of 2-stage all-to-all, the input tensor must be divisible by 2 * global_world_size
+            # Due to the constraint of 2-stage all-to-all, the input tensor must be divisible by 2 * global_wo rld_size
             # Otherwise, all-to-all cannot be performed because of shape mismatch.
             # See more at https://github.com/microsoft/DeepSpeed/pull/5056
             logger.warning(
