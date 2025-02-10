@@ -934,10 +934,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
                 model = deepspeed.zero.Init(module=model)
         """
+        # 处理弃用的config参数
         if config is not None:
             config_dict_or_path = config
             logger.warning(
                 f'zero.Init: the `config` argument is deprecated. Please use `config_dict_or_path` instead.')
+        # 加载deepspeed配置
         _ds_config = deepspeed.runtime.config.DeepSpeedConfig(config_dict_or_path,
                                                               mpu) if config_dict_or_path is not None else None
         if _ds_config is not None:
@@ -962,9 +964,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 )
             self.ds_process_group = sequence_data_parallel_group
 
+        # 获取当前rank和数据并行组的大小
         self.rank = dist.get_rank(group=self.ds_process_group)
         self.dp_world_size = dist.get_world_size(group=self.ds_process_group)
 
+        # ZeRO参数并行组
         self.zero_param_process_group = zero_param_parallel_group
         if _ds_config is not None and _ds_config.zero_config.zero_hpz_partition_size > 1 and self.zero_param_process_group is None:
             groups._create_zero_param_parallel_group(_ds_config.zero_config.zero_hpz_partition_size)
@@ -1010,6 +1014,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         self._validate_remote_device(remote_device, _ds_config)
 
+        # Remote device => CPU, NVMe
         # Remote device is the device where parameter partitions are stored
         # It can be same as local_device or it could be CPU or NVMe.
         self.remote_device = self.local_device if remote_device in [None, OffloadDeviceEnum.none] else remote_device
@@ -1042,14 +1047,18 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         Init.model_persistence_threshold = ds_config.zero_config.model_persistence_threshold // self.num_partitions
 
     def _zero_init_param(self, param):
+        # 拓展 torch param 增加必要的属性和方法
         self._convert_to_deepspeed_param(param)
+        # broadcast param data
         if dist.get_world_group() == self.get_dp_process_group():
             dist.broadcast(param.data, 0, self.get_dp_process_group())
         else:
             dist.broadcast(param.data, dist.get_global_rank(self.get_dp_process_group(), 0),
                            self.get_dp_process_group())
+        # partition param
         param.partition()
 
+    # param 分发函数
     def _convert_to_zero_parameters(self, param_list):
         for param in param_list:
             if is_zero_param(param):
@@ -1097,6 +1106,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             f"Param count {InsertPostInitMethodToModuleSubClasses.num_module_elements}. After converting and partitioning params in {module.__class__.__name__}",
             force=False)
 
+    # param->deepspeed_param
     def _convert_to_deepspeed_param(self, param):
 
         # Partitioned, Normal, Remote
@@ -1579,6 +1589,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             tensor_size = self._aligned_size(param)
             partition_size = tensor_size // self.num_partitions
+            # init 
             if param.ds_tensor is None:
                 final_location = None
                 if self.remote_device == OffloadDeviceEnum.nvme and self.param_swapper.swappable_tensor(

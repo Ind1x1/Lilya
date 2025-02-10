@@ -475,6 +475,7 @@ class PartitionedParameterCoordinator:
                 with get_accelerator().stream(self.__allgather_stream):
                     event_name = __class__.FORWARD_ALL_GATHER if forward else __class__.BACKWARD_ALL_GATHER
                     self.__profiler.start_event(event_name)
+                    # import gather
                     handle = param_group[0].all_gather_coalesced(param_group, quantize=quantize)
                     self.__profiler.stop_event(event_name, all_gather_numel)
                 for param in param_group:
