@@ -318,6 +318,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 if param.requires_grad:
                     param.grad_accum = None
                     trainable_parameters.append(param)
+            # bit16_groups contains all the parameters in the model
             self.bit16_groups.append(trainable_parameters)
 
             # not sure why apex was cloning the weights before flattening
@@ -343,6 +344,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             if self.round_robin_gradients:
                 round_robin_tensors, round_robin_indices = self._round_robin_reorder(
                     self.bit16_groups[i], dist.get_world_size(group=self.real_dp_process_group[i]))
+                # robin tensors 返回的round_robin_tensors是按照round_robin_indices的顺序对bit16_groups[i]重新排列的
             else:
                 round_robin_tensors = self.bit16_groups[i]
                 round_robin_indices = list(range(len(self.bit16_groups[i])))
@@ -372,7 +374,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             see_memory_usage(f"After flattening and moving param group {i} to GPU", force=False)
 
-            # Record padding required for alignment
+            # Record padding required for alignment last partition have padding record the padding size
             if partition_id == dist.get_world_size(group=self.real_dp_process_group[i]) - 1:
                 padding = self.bit16_groups_flat[i].numel() - orig_group_numel
             else:
@@ -387,7 +389,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             # divide the flat weights into near equal partition equal to the data parallel degree
             # each process will compute on a different part of the partition
-            data_parallel_partitions = self.get_data_parallel_partitions(self.bit16_groups_flat[i], i)
+            # 切分flat tensor
+            data_parallel_partitions = self.get_data_parallel_partitions(self.bit16_groups_flat[i], i) 
             self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
 
             # verify that data partition start locations are 4-byte aligned
@@ -403,7 +406,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             else:
                 weights_partition = self.parallel_partitioned_bit16_groups[i][partition_id].to(
                     self.device).clone().half().detach()
-
+            
             if self.cpu_offload:
                 weights_partition = get_accelerator().pin_memory(weights_partition)
 
@@ -558,6 +561,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         self._enable_universal_checkpoint()
         self._param_slice_mappings = self._create_param_mapping()
+        
+        #zoetic
+        self.zoetic_FLAG = False
+
+        self.zoetic_buffer = None
+        self.zoetic_index = 0
+        self.zoetic_offset = 0
+        self.zoetic_numel = 0
 
         #TODO vertin
         self.vertin_FLAG = False
@@ -1395,6 +1406,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         #print(f"ID {self.get_param_id(param)} grad norm {param.grad.norm()}")
         if self.grads_in_partition is None:
+            self.zoetic_offset = 0
+            self.zoetic_numel = 0
             self.grads_in_partition_offset = 0
             total_size = 0
             for group in self.params_in_partition:
@@ -1414,14 +1427,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         grad_reduc.data = new_grad_tensor.data.view_as(grad_reduc)
         #print(f"Grad norm after copy to contiguous_buffer {param.grad.data.norm()}")
         self.grads_in_partition_offset += param.numel()
+        
+        # TO here 到这里的时候，param.grad已经被拷贝到了grads_in_partition中 self.grads_in_partition[self.grads_in_partition_offset, self.grads_in_partition_offset+param.numel()]
+        self.zoetic = param.numel()
 
-        if self.vertin_Create_FLAG:
-            stream = self.vertin_stream
-            with get_accelerator().stream(stream):
-                start_time = time.time()
-                self.vertin_async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
-                end_time = time.time()
-                # logger.info(f"copy time = {end_time-start_time}")
+        # Laster TODO vertin
+        # if self.vertin_Create_FLAG:
+        #     stream = self.vertin_stream
+        #     with get_accelerator().stream(stream):
+        #         start_time = time.time()
+        #         self.vertin_async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
+        #         end_time = time.time()
+        #         # logger.info(f"copy time = {end_time-start_time}")
 
     def reduce_ipg_grads(self):
         if self.contiguous_gradients:
@@ -1663,6 +1680,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             partitions.append(tensor.narrow(0, start, partition_size))
             start = start + partition_size
         return partitions
+    
+    def get_data_checkpoint_partitions(self, tensor, group_id):
+        partitions = []
+
+        dp = dist.get_world_size(group=self.real_dp_process_group[group_id])
+
+        total_num_elements = tensor.numel()
 
     def get_partition_info(self, tensor_list, partition_size, partition_id):
         params_in_partition = []
@@ -1926,10 +1950,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         #else:
         #    self.optimizer.step()
 
-        if not self.vertin_Create_FLAG:
-            self._vertin_create_param_groups(original_param_groups)
-        else:
-            self.vertin_pool.submit(self._vertin_step, group_no)
+        # laster TODO vertin
+        # if not self.vertin_Create_FLAG:
+        #     self._vertin_create_param_groups(original_param_groups)
+        # else:
+        #     self.vertin_pool.submit(self._vertin_step, group_no)
 
 
         self.optimizer.step()
@@ -2149,6 +2174,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         inf = float_x.isinf()
         inf_or_nan = nan.logical_or(inf)
         return inf_or_nan.float().max()
+    
+    def _vertin_create_buf(self, zoetic_flag = False, bucket_size = 500000):
+        if zoetic_flag:
+            self.zoetic_buffer = []
+            buf_0 = torch.empty(bucket_size, dtype=self.dtype,device=get_accelerator().current_device_name())
+            self.zoetic_buffer.append(buf_0)
+            buf_1 = torch.empty(bucket_size, dtype=self.dtype,device=get_accelerator().current_device_name())
+            self.zoetic_buffer.append(buf_1)
+            self.zoetic_index = 0
 
     def backward(self, loss, retain_graph=False):
         """
@@ -2174,6 +2208,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                     device=get_accelerator().current_device_name())
                 self.ipg_buffer.append(buf_1)
             self.ipg_index = 0
+
+        self._vertin_create_buf(self.zoetic_flag, self.bucket_size)
 
         if self.custom_loss_scaler:
             scaled_loss = self.external_loss_scale * loss
