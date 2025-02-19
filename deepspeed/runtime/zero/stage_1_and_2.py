@@ -1429,7 +1429,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.grads_in_partition_offset += param.numel()
         
         # TO here 到这里的时候，param.grad已经被拷贝到了grads_in_partition中 self.grads_in_partition[self.grads_in_partition_offset, self.grads_in_partition_offset+param.numel()]
-        self.zoetic = param.numel()
+        #  = param.numel()
 
         # Laster TODO vertin
         # if self.vertin_Create_FLAG:
@@ -2209,7 +2209,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 self.ipg_buffer.append(buf_1)
             self.ipg_index = 0
 
-        self._vertin_create_buf(self.zoetic_flag, self.bucket_size)
+        # self._vertin_create_buf(self.zoetic_flag, self.bucket_size)
 
         if self.custom_loss_scaler:
             scaled_loss = self.external_loss_scale * loss

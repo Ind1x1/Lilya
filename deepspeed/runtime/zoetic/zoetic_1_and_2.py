@@ -142,7 +142,7 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
                  fp16_master_weights_and_gradients=False,
                  elastic_checkpoint=False,
                  vertin_cpu_optimizer = None):
-    
+        
         if offload_optimizer_config is not None and offload_optimizer_config.device != OffloadDeviceEnum.none:
             self.cpu_offload = True
             self.cpu_offload_pin_memory = offload_optimizer_config.pin_memory
@@ -248,7 +248,10 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
             assert self.communication_data_type in valid_reduce_scatter_dtypes, f"{self.zero_stage_string} supports {valid_reduce_scatter_dtypes} communication_data_type with reduce scatter enabled. Got: '{self.communication_data_type}'"
             assert self.gradient_predivide_factor == 1.0, f"gradient_predivide_factor != 1.0 is not yet supported with {self.zero_stage_string} with reduce scatter enabled"
             assert self.postscale_gradients, f"pre-scale gradients is not yet supported with {self.zero_stage_string} with reduce scatter enabled"
-
+        #######################################################################################
+        self.zoetic_partition_of_fp32_groups = []
+        self.zoetic_partition_of_fp32_groups_local = []
+        #######################################################################################
         # param flattened by groups
         self.bit16_groups = []
         self.bit16_groups_flat = []
@@ -308,6 +311,9 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
         # loop to deal with groups
         for i, param_group in enumerate(self.optimizer.param_groups):
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
+            #########################################################################
+            checkpoint_id = self.replica_rank(partition_id)
+            #########################################################################
 
             # push this group to list before modify
             # TODO: Explore simplification that avoids the extra book-keeping by pushing the reordered group
@@ -390,6 +396,7 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
             # 切分flat tensor
             data_parallel_partitions = self.get_data_parallel_partitions(self.bit16_groups_flat[i], i) 
             self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
+            self.zoetic_partition_of_fp32_groups_local.append(data_parallel_partitions)
 
             # verify that data partition start locations are 4-byte aligned
             for partitioned_data in data_parallel_partitions:
@@ -405,6 +412,19 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
                 weights_partition = self.parallel_partitioned_bit16_groups[i][partition_id].to(
                     self.device).clone().half().detach()
             
+            #########################################################################
+            # 最终版本这里应该是个for循环 以创建复数副本
+            # partition_id is the shard rank of local 
+            if not fp16_master_weights_and_gradients:
+                checkpoint_partition = self.parallel_partitioned_bit16_groups[i][checkpoint_id].clone().float().detach().cpu().share_memory_()
+            else:
+                checkpoint_partition = self.parallel_partitioned_bit16_groups[i][checkpoint_id].clone().float().detach().cpu().share_memory_()
+
+            self.zoetic_partition_of_fp32_groups.append(checkpoint_partition)
+            self.zoetic_partition_of_fp32_groups[
+                i].requires_grad = True  # keep this in case internal optimizer uses it
+            
+            ##########################################################################
             if self.cpu_offload:
                 weights_partition = get_accelerator().pin_memory(weights_partition)
 
@@ -426,6 +446,36 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
             self.params_not_in_partition.append(params_not_in_partition)
             self.first_offset.append(first_offset)
 
+        #########################################################################################################
+        # local replica
+        self.local_optimizer_param_groups = copy.deepcopy(self.optimizer.param_groups)
+        for i, param_group in enumerate(self.local_optimizer_param_groups):
+            param_group['params'] = [param.detach().clone().cpu().share_memory_() for param in param_group['params']]
+            for tensor in param_group['params']:
+                tensor.requires_grad = True
+            if 'bias_correction' not in param_group:
+                param_group['bias_correction'] = True
+        for i, param_group in enumerate(self.local_optimizer_param_groups):
+            for param in param_group['params']:
+                single_grad_partition = torch.zeros(int(param.numel()),
+                                                    dtype = self.single_partition_of_fp32_groups[i].dtype,
+                                                    device = 'cpu')
+                single_grad_partition.share_memory_()
+                param.grad = single_grad_partition
+        #########################################################################################################
+        self.remote_optimizer_param_groups = copy.deepcopy(self.optimizer.param_groups)
+        for i, param_group in enumerate(self.remote_optimizer_param_groups):
+             param_group['params'] = [self.zoetic_partition_of_fp32_groups[i]]
+        for i, param_group in enumerate(self.remote_optimizer_param_groups):
+            for param in param_group['params']:
+                single_grad_partition = torch.zeros(int(param.numel()),
+                                                    dtype = self.zoetic_partition_of_fp32_groups[i].dtype,
+                                                    device = 'cpu')
+                single_grad_partition.share_memory_()
+                param.grad = single_grad_partition
+        #########################################################################################################
+        # 至此我们获得了两个 两个optimizer self.remote_optimizer_param_groups slef.local_optimizer_param_groups
+        #########################################################################################################
         self.reduce_bucket_size = int(reduce_bucket_size)
         self.use_multi_rank_bucket_allreduce = use_multi_rank_bucket_allreduce
         self.allgather_bucket_size = int(allgather_bucket_size)
@@ -559,9 +609,8 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
 
         self._enable_universal_checkpoint()
         self._param_slice_mappings = self._create_param_mapping()
-
         ########################################################################################################
-        
+
         self.dist_world_size = dist.get_world_size()
         self.dist_local_rank = dist.get_local_rank()
         self.dist_rank = dist.get_rank()
@@ -589,6 +638,9 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
 
         # zoetic 
         self.zoetic_bit16_group = []
+        self.zoetic_interwine = []
+        self.vertin_grad = []
+        self.zoetic_bucket_size = 50000
 
     # import re-init zoetic param group
     # def zoetic_param_group_init(self):
@@ -617,10 +669,278 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
             return dist.new_group([0, 1])
         else:  # rank 2 和 3 成为一组
             return dist.new_group([2, 3])
-        
+    
 
     def initialize_checkpoint_placement(self, rank, machine_count, replice):
         pass
     
     def initialize_checkpoint_group(self,checkpoint_group):
         pass
+    
+    def replica_rank(self, partition_id):
+        if partition_id == 0:
+            return 1
+        elif partition_id == 1:
+            return 0
+        elif partition_id == 2:
+            return 3
+        elif partition_id == 3:
+            return 2
+        
+    # 重构backward 主要是为了加一个 zoetic buf 以实现梯度啊传递
+    def backward(self, loss, retain_graph=False):
+        """
+        :attr:`backward` performs the following steps:
+
+        1. fp32_loss = loss.float()
+        2. scaled_loss = fp32_loss*loss_scale
+        3. scaled_loss.backward(), which accumulates scaled gradients into the ``.grad`` attributes of the model's fp16 leaves
+        """
+        self.micro_step_id += 1
+
+        if self.contiguous_gradients:
+            self.ipg_buffer = []
+            buf_0 = torch.empty(int(self.reduce_bucket_size),
+                                dtype=self.dtype,
+                                device=get_accelerator().current_device_name())
+            self.ipg_buffer.append(buf_0)
+
+            # Use double buffers to avoid data access conflict when overlap_comm is enabled.
+            if self.overlap_comm:
+                buf_1 = torch.empty(int(self.reduce_bucket_size),
+                                    dtype=self.dtype,
+                                    device=get_accelerator().current_device_name())
+                self.ipg_buffer.append(buf_1)
+            self.ipg_index = 0
+
+        self._vertin_create_buf(self.zoetic_flag, self.zoetic_bucket_size)
+
+        if self.custom_loss_scaler:
+            scaled_loss = self.external_loss_scale * loss
+            scaled_loss.backward()
+        else:
+            self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
+
+        # Only for Stage 1, Mode 2
+        if self.use_grad_accum_attribute:
+            self.fill_grad_accum_attribute()
+
+
+    def _vertin_create_buf(self, zoetic_flag = False, bucket_size = 50000):
+        if zoetic_flag:
+            self.zoetic_buffer = []
+            buf_0 = torch.empty(bucket_size, dtype=self.dtype,device=get_accelerator().current_device_name())
+            buf_1 = torch.empty(bucket_size, dtype=self.dtype,device=get_accelerator().current_device_name())
+            self.zoetic_buffer.append([buf_0,buf_1])
+            buf_2 = torch.empty(bucket_size, dtype=self.dtype,device=get_accelerator().current_device_name())
+            buf_3 = torch.empty(bucket_size, dtype=self.dtype,device=get_accelerator().current_device_name())
+            self.zoetic_buffer.append([buf_2,buf_3])
+            self.zoetic_index = 0
+    
+    # hook 
+    # 考虑到在acc的时候我们应该只需要取最终的梯度，所以我觉得应该跨过reduce_ipg_grads
+
+    def step(self, closure=None):
+        """
+        Not supporting closure.
+        """
+        self.micro_step_id = INITIAL_MICRO_STEP_ID
+
+        see_memory_usage(f"In step before checking overflow")
+
+        # First compute norm for all group so we know if there is overflow
+        if self.dtype == torch.float16:
+            self.check_overflow()
+
+        prev_scale = self.loss_scale
+        self._update_scale(self.overflow)
+        if self.overflow:
+            see_memory_usage('After overflow before clearing gradients')
+            self.zero_grad(set_to_none=True)
+            if self.cpu_offload:
+                self.reset_cpu_buffers()
+            else:
+                self.averaged_gradients = {}
+
+            see_memory_usage('After overflow after clearing gradients')
+
+            for timer in OPTIMIZER_TIMERS:
+                self.timers(timer).start()
+                self.timers(timer).stop()
+            return
+
+        # Step 1:- Calculate gradient norm using bit-16 grads
+        see_memory_usage('Before norm calculation')
+        scaled_global_grad_norm = self.scaled_global_norm()
+        self._global_grad_norm = scaled_global_grad_norm / prev_scale
+        see_memory_usage('After norm before optimizer')
+
+        # Step 2:- run optimizer and upscaling simultaneously
+        for i, group in enumerate(self.bit16_groups):
+            self.timers(OPTIMIZER_GRADIENTS_TIMER).start()
+            partition_id = dist.get_rank(group=self.real_dp_process_group[i])
+            if self.cpu_offload:
+                single_grad_partition = self.single_partition_of_fp32_groups[i].grad
+                self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
+
+                self.timers(OPTIMIZER_GRADIENTS_TIMER).stop()
+                self.timers(OPTIMIZER_STEP_TIMER).start()
+                self._optimizer_step(i)
+
+                # Disabled, this is not currently working
+                #from deepspeed.ops.adam import DeepSpeedCPUAdam
+                #if not (type(self.optimizer) == DeepSpeedCPUAdam and self.dtype == torch.half):
+                #    bit16_partitions = self.parallel_partitioned_bit16_groups[i]
+                #    fp32_partition = self.single_partition_of_fp32_groups[i]
+                #    bit16_partitions[partition_id].data.copy_(fp32_partition.data)
+                bit16_partitions = self.parallel_partitioned_bit16_groups[i]
+                fp32_partition = self.single_partition_of_fp32_groups[i]
+                bit16_partitions[partition_id].data.copy_(
+                    fp32_partition.to(get_accelerator().current_device_name()).data)
+
+                self.timers(OPTIMIZER_STEP_TIMER).stop()
+            else:
+                # free gradients for all the parameters that are not updated by this process(ZeRO stage2)
+                self.free_grad_in_param_list(self.params_not_in_partition[i])
+
+                # create a flat gradients for parameters updated by this process
+                # If we are last partition, ensure we have same size grads and partition size, if not pad with zero tensors
+                if partition_id == dist.get_world_size(group=self.real_dp_process_group[i]) - 1:
+                    single_grad_partition = self.flatten_dense_tensors_aligned(
+                        self.averaged_gradients[i],
+                        int(self.partition_size[i])).to(self.single_partition_of_fp32_groups[i].dtype)
+                else:
+                    single_grad_partition = self.flatten(self.averaged_gradients[i]).to(
+                        self.single_partition_of_fp32_groups[i].dtype)
+                assert single_grad_partition.numel() == self.partition_size[i], \
+                    "averaged gradients have different number of elements that partition size {} {} {} {}".format(
+                        single_grad_partition.numel(), self.partition_size[i], i, partition_id)
+
+                self.single_partition_of_fp32_groups[i].grad = single_grad_partition
+                # release all the gradient since we have already created a necessary copy in dp_grad_partition(ZeRO stage2)
+                self.free_grad_in_param_list(self.params_in_partition[i])
+
+                self.averaged_gradients[i] = None
+
+                self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
+
+                self.timers(OPTIMIZER_GRADIENTS_TIMER).stop()
+
+                # Step 3:- run the optimizer if no offloading
+                self.timers(OPTIMIZER_STEP_TIMER).start()
+                self._optimizer_step(i)
+                # Step 4:- get rid of the fp32 gradients. Not needed anymore
+                self.single_partition_of_fp32_groups[i].grad = None
+                ############################获得local checkpoint grad########################
+                # del single_grad_partition
+                self.vertin_grad.append(single_grad_partition)
+                self.zoetic_async_copy_grad_from_gpu(i, single_grad_partition) 
+                ############################
+                bit16_partitions = self.parallel_partitioned_bit16_groups[i]
+                fp32_partition = self.single_partition_of_fp32_groups[i]
+                bit16_partitions[partition_id].data.copy_(fp32_partition.data)
+                self.timers(OPTIMIZER_STEP_TIMER).stop()
+
+        see_memory_usage('After optimizer before all-gather')
+        if self.cpu_offload:
+            self.reset_cpu_buffers()
+
+        self.timers(OPTIMIZER_ALLGATHER_TIMER).start()
+        # Gather the updated weights from everyone.
+        # Then all partitions of the model parameters are updated and ready for next round forward.
+        all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
+                             partitioned_param_groups=self.parallel_partitioned_bit16_groups,
+                             dp_process_group=self.real_dp_process_group,
+                             start_alignment_factor=self.nccl_start_alignment_factor,
+                             allgather_bucket_size=self.allgather_bucket_size)
+        self.timers(OPTIMIZER_ALLGATHER_TIMER).stop()
+
+        # TODO: we probably don't need this? just to be safe
+        for i in range(len(self.bit16_groups)):
+            self._update_model_bit16_weights(i)
+
+        self.timers.log(OPTIMIZER_TIMERS)
+        see_memory_usage('After zero_optimizer step')
+
+        return
+    
+
+    def zoetic_async_copy_grad_from_gpu(self, id ,grad):
+        with get_accelerator().stream(self.cpu_vertin_stream):
+            dest_tensor = self.local_optimizer_param_groups[id]['params'][0].grad
+            dest_tensor.copy_(grad, non_blocking=True)
+
+    def zoetic_comm_interwin(self):
+        """
+        accoding to 
+        """
+        self.zoetic_interwine.append(self.vertin_grad) # list [tensor1,tensor2,tensor3,tensor4]
+        self.vertin_grad = None
+
+    # def zoetic_all_gather_grad(self):
+    #     #  这里 0 是有误的
+    #     self.zoetic_comm_interwine() # 切分全尺寸张量
+    #     zoetic_rank = dist.get_rank(self.zoetic_checkpoint_group)
+    #     for tensor in enumerate(self.zoetic_interwin):
+    #         offset = 0
+    #         block_size = self.zoetic_bucket_size
+    #         while offset+block_size < tensor.numel():
+    #             dist.all_gather(self.zoetic_buffer[self.zoetic_index],tensor[offset:offset+block_size],group=self.zoetic_checkpoint_group)
+    #             self.remote_optimizer_param_groups[0]['params'][0].grad[offset:offset+block_size].copy_(self.zoetic_buffer[self.zoetic_index][1-zoetic_rank])
+    #             offset += block_size
+    #         if offset < tensor.numel():
+    #             laster_tensors = [torch.empty_like(tensor[offset:]) for _ in range(dist.get_world_size(self.zoetic_checkpoint_group))]
+    #             dist.all_gather(laster_tensors,tensor[offset:],group=self.zoetic_checkpoint_group)
+    #             self.remote_optimizer_param_groups[0]['params'][0].grad[offset:].copy_(laster_tensors[1-zoetic_rank])
+
+    #     self.zoetic_interwine = []
+
+    def zoetic_all_gather_grad(self):
+        zoetic_rank = dist.get_rank(self.zoetic_checkpoint_group)
+        for tensor in self.vertin_grad:
+            offset = 0
+            block_size = self.zoetic_bucket_size
+            while offset+block_size < tensor.numel():
+                dist.all_gather(self.zoetic_buffer[self.zoetic_index],tensor[offset:offset+block_size],group=self.zoetic_checkpoint_group)
+                self.remote_optimizer_param_groups[0]['params'][0].grad[offset:offset+block_size].copy_(self.zoetic_buffer[self.zoetic_index][1-zoetic_rank])
+                offset += block_size
+            if offset < tensor.numel():
+                laster_tensors = [torch.empty_like(tensor[offset:]) for _ in range(dist.get_world_size(self.zoetic_checkpoint_group))]
+                dist.all_gather(laster_tensors,tensor[offset:],group=self.zoetic_checkpoint_group)
+                self.remote_optimizer_param_groups[0]['params'][0].grad[offset:].copy_(laster_tensors[1-zoetic_rank])
+        self.vertin_grad = []
+            
+    # def zoetic_all_gather_grad(self):
+    #     zoetic_rank = dist.get_rank(self.vertin_checkpoint_group)
+    #     print(self.vertin_grad)
+    #     if self.vertin_grad ==[]:
+    #         return
+    #     for tensor in self.vertin_grad:
+    #         offset = 0
+    #         block_size = self.zoetic_bucket_size
+    #         while offset+block_size < tensor.numel():
+    #             index = self.zoetic_index
+    #             self.cpu_vertin_stream.synchronize()
+    #             with get_accelerator().stream(self.gpu_vertin_stream):
+    #                 dist.all_gather(self.zoetic_buffer[index],tensor[offset:offset+block_size],group=self.vertin_checkpoint_group)
+    #                 #self.remote_optimizer_param_groups[0]['params'][0].grad[offset:offset+block_size].copy_(self.zoetic_buffer[self.zoetic_index][1-zoetic_rank])
+
+    #             self.gpu_vertin_stream.synchronize()
+                
+    #             with get_accelerator().stream(self.cpu_vertin_stream):
+    #                 self.remote_optimizer_param_groups[0]['params'][0].grad[offset:offset+block_size].copy_(self.zoetic_buffer[index][1-zoetic_rank])
+    #             offset += block_size
+    #             self.zoetic_index = 1 - self.zoetic_index
+
+    #         self.cpu_vertin_stream.synchronize()
+    #         self.gpu_vertin_stream.synchronize()
+    #         with get_accelerator().stream(self.gpu_vertin_stream):
+    #             if offset < tensor.numel():
+    #                 laster_tensors = [torch.empty_like(tensor[offset:]) for _ in range(dist.get_world_size(self.vertin_checkpoint_group))]
+    #                 dist.all_gather(laster_tensors,tensor[offset:],group=self.vertin_checkpoint_group)
+    #                 self.remote_optimizer_param_groups[0]['params'][0].grad[offset:].copy_(laster_tensors[1-zoetic_rank])
+    #             print_rank_msg(self.remote_optimizer_param_groups[0]['params'][0].grad)
+    #             print_rank_msg(self.remote_optimizer_param_groups[0]['params'][0].grad.size())
+    #             self.vertin_grad = []
+        
+
