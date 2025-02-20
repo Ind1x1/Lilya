@@ -942,5 +942,124 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
     #             print_rank_msg(self.remote_optimizer_param_groups[0]['params'][0].grad)
     #             print_rank_msg(self.remote_optimizer_param_groups[0]['params'][0].grad.size())
     #             self.vertin_grad = []
+    
+    def step(self, closure=None):
+        """
+        Not supporting closure.
+        """
+        self.micro_step_id = INITIAL_MICRO_STEP_ID
+
+        see_memory_usage(f"In step before checking overflow")
+
+        # First compute norm for all group so we know if there is overflow
+        if self.dtype == torch.float16:
+            self.check_overflow()
+
+        prev_scale = self.loss_scale
+        self._update_scale(self.overflow)
+        if self.overflow:
+            see_memory_usage('After overflow before clearing gradients')
+            self.zero_grad(set_to_none=True)
+            if self.cpu_offload:
+                self.reset_cpu_buffers()
+            else:
+                self.averaged_gradients = {}
+
+            see_memory_usage('After overflow after clearing gradients')
+
+            for timer in OPTIMIZER_TIMERS:
+                self.timers(timer).start()
+                self.timers(timer).stop()
+            return
+
+        # Step 1:- Calculate gradient norm using bit-16 grads
+        see_memory_usage('Before norm calculation')
+        scaled_global_grad_norm = self.scaled_global_norm()
+        self._global_grad_norm = scaled_global_grad_norm / prev_scale
+        see_memory_usage('After norm before optimizer')
+
+        # Step 2:- run optimizer and upscaling simultaneously
+        for i, group in enumerate(self.bit16_groups):
+            self.timers(OPTIMIZER_GRADIENTS_TIMER).start()
+            partition_id = dist.get_rank(group=self.real_dp_process_group[i])
+            if self.cpu_offload:
+                single_grad_partition = self.single_partition_of_fp32_groups[i].grad
+                self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
+
+                self.timers(OPTIMIZER_GRADIENTS_TIMER).stop()
+                self.timers(OPTIMIZER_STEP_TIMER).start()
+                self._optimizer_step(i)
+
+                # Disabled, this is not currently working
+                #from deepspeed.ops.adam import DeepSpeedCPUAdam
+                #if not (type(self.optimizer) == DeepSpeedCPUAdam and self.dtype == torch.half):
+                #    bit16_partitions = self.parallel_partitioned_bit16_groups[i]
+                #    fp32_partition = self.single_partition_of_fp32_groups[i]
+                #    bit16_partitions[partition_id].data.copy_(fp32_partition.data)
+                bit16_partitions = self.parallel_partitioned_bit16_groups[i]
+                fp32_partition = self.single_partition_of_fp32_groups[i]
+                bit16_partitions[partition_id].data.copy_(
+                    fp32_partition.to(get_accelerator().current_device_name()).data)
+
+                self.timers(OPTIMIZER_STEP_TIMER).stop()
+            else:
+                # free gradients for all the parameters that are not updated by this process(ZeRO stage2)
+                self.free_grad_in_param_list(self.params_not_in_partition[i])
+
+                # create a flat gradients for parameters updated by this process
+                # If we are last partition, ensure we have same size grads and partition size, if not pad with zero tensors
+                if partition_id == dist.get_world_size(group=self.real_dp_process_group[i]) - 1:
+                    single_grad_partition = self.flatten_dense_tensors_aligned(
+                        self.averaged_gradients[i],
+                        int(self.partition_size[i])).to(self.single_partition_of_fp32_groups[i].dtype)
+                else:
+                    single_grad_partition = self.flatten(self.averaged_gradients[i]).to(
+                        self.single_partition_of_fp32_groups[i].dtype)
+                assert single_grad_partition.numel() == self.partition_size[i], \
+                    "averaged gradients have different number of elements that partition size {} {} {} {}".format(
+                        single_grad_partition.numel(), self.partition_size[i], i, partition_id)
+
+                self.single_partition_of_fp32_groups[i].grad = single_grad_partition
+                # release all the gradient since we have already created a necessary copy in dp_grad_partition(ZeRO stage2)
+                self.free_grad_in_param_list(self.params_in_partition[i])
+
+                self.averaged_gradients[i] = None
+
+                self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
+
+                self.timers(OPTIMIZER_GRADIENTS_TIMER).stop()
+
+                # Step 3:- run the optimizer if no offloading
+                self.timers(OPTIMIZER_STEP_TIMER).start()
+                self._optimizer_step(i)
+                # Step 4:- get rid of the fp32 gradients. Not needed anymore
+                self.single_partition_of_fp32_groups[i].grad = None
+                del single_grad_partition
+                bit16_partitions = self.parallel_partitioned_bit16_groups[i]
+                fp32_partition = self.single_partition_of_fp32_groups[i]
+                bit16_partitions[partition_id].data.copy_(fp32_partition.data)
+                self.timers(OPTIMIZER_STEP_TIMER).stop()
+
+        see_memory_usage('After optimizer before all-gather')
+        if self.cpu_offload:
+            self.reset_cpu_buffers()
+
+        self.timers(OPTIMIZER_ALLGATHER_TIMER).start()
+        # Gather the updated weights from everyone.
+        # Then all partitions of the model parameters are updated and ready for next round forward.
+        all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
+                             partitioned_param_groups=self.parallel_partitioned_bit16_groups,
+                             dp_process_group=self.real_dp_process_group,
+                             start_alignment_factor=self.nccl_start_alignment_factor,
+                             allgather_bucket_size=self.allgather_bucket_size)
+        self.timers(OPTIMIZER_ALLGATHER_TIMER).stop()
+
+        # TODO: we probably don't need this? just to be safe
+        for i in range(len(self.bit16_groups)):
+            self._update_model_bit16_weights(i)
+
+        self.timers.log(OPTIMIZER_TIMERS)
+        see_memory_usage('After zero_optimizer step')
         
+        return
 
