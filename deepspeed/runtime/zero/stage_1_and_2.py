@@ -254,6 +254,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # param flattened by groups
         self.bit16_groups = []
         self.bit16_groups_flat = []
+        
+        #######################################################################################
+        self.zoetic_partition_of_fp32_groups = []
+        self.zoetic_partition_of_fp32_groups_local = []
+        #######################################################################################
 
         # param partitioned by data parallel degree
         # this will contain a list of equal sized tensors
@@ -271,11 +276,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         # These are the parameters that will be updated by this process directly
         self.params_in_partition = []
+        #######################################################################################
+        self.zoetic_in_partition = []
+
+        self.zoetic_not_in_partition = []
+        #######################################################################################
 
         # Offset from the first parameter in the self.params_in_partition
         # the parameter boundaries may not align with partition boundaries
         # so we need to keep track of the offset
         self.first_offset = []
+        self.zoetic_offset = []
 
         # number of elements per partition in each group
         self.partition_size = []
@@ -310,7 +321,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # loop to deal with groups
         for i, param_group in enumerate(self.optimizer.param_groups):
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
-
+            #########################################################################
+            checkpoint_id = self.replica_rank(partition_id)
+            #########################################################################
             # push this group to list before modify
             # TODO: Explore simplification that avoids the extra book-keeping by pushing the reordered group
             trainable_parameters = []
@@ -407,6 +420,19 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 weights_partition = self.parallel_partitioned_bit16_groups[i][partition_id].to(
                     self.device).clone().half().detach()
             
+            #########################################################################
+            # 最终版本这里应该是个for循环 以创建复数副本
+            # partition_id is the shard rank of local 
+            if not fp16_master_weights_and_gradients:
+                checkpoint_partition = self.parallel_partitioned_bit16_groups[i][checkpoint_id].clone().float().detach().cpu().share_memory_()
+            else:
+                checkpoint_partition = self.parallel_partitioned_bit16_groups[i][checkpoint_id].clone().float().detach().cpu().share_memory_()
+
+            self.zoetic_partition_of_fp32_groups.append(checkpoint_partition)
+            self.zoetic_partition_of_fp32_groups[
+                i].requires_grad = True  # keep this in case internal optimizer uses it            
+            ##########################################################################
+
             if self.cpu_offload:
                 weights_partition = get_accelerator().pin_memory(weights_partition)
 
@@ -422,11 +448,47 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             partition_size = len(self.bit16_groups_flat[i]) / dist.get_world_size(group=self.real_dp_process_group[i])
             params_in_partition, params_not_in_partition, first_offset = self.get_partition_info(
                 self.round_robin_bit16_groups[i], partition_size, partition_id)
-
+            ########################################################################## 1 repblica
+            zoetic_remote_partition,zoetic_not_in_partition,zoetic_offset = self.get_partition_info(self.round_robin_bit16_groups[i], partition_size, partition_id)
+            self.zoetic_in_partition.append(zoetic_remote_partition)
+            self.zoetic_first_offset.append(zoetic_offset)
+            self.zoetic_not_in_partition.append(zoetic_not_in_partition)
+            ##########################################################################
             self.partition_size.append(partition_size)
             self.params_in_partition.append(params_in_partition)
             self.params_not_in_partition.append(params_not_in_partition)
             self.first_offset.append(first_offset)
+
+        #########################################################################################################
+        # local replica
+        self.local_optimizer_param_groups = copy.deepcopy(self.optimizer.param_groups)
+        for i, param_group in enumerate(self.local_optimizer_param_groups):
+            param_group['params'] = [param.detach().clone().cpu().share_memory_() for param in param_group['params']]
+            for tensor in param_group['params']:
+                tensor.requires_grad = True
+            if 'bias_correction' not in param_group:
+                param_group['bias_correction'] = True
+        for i, param_group in enumerate(self.local_optimizer_param_groups):
+            for param in param_group['params']:
+                single_grad_partition = torch.zeros(int(param.numel()),
+                                                    dtype = self.single_partition_of_fp32_groups[i].dtype,
+                                                    device = 'cpu')
+                single_grad_partition.share_memory_()
+                param.grad = single_grad_partition
+        #########################################################################################################
+        self.remote_optimizer_param_groups = copy.deepcopy(self.optimizer.param_groups)
+        for i, param_group in enumerate(self.remote_optimizer_param_groups):
+             param_group['params'] = [self.zoetic_partition_of_fp32_groups[i]]
+        for i, param_group in enumerate(self.remote_optimizer_param_groups):
+            for param in param_group['params']:
+                single_grad_partition = torch.zeros(int(param.numel()),
+                                                    dtype = self.zoetic_partition_of_fp32_groups[i].dtype,
+                                                    device = 'cpu')
+                single_grad_partition.share_memory_()
+                param.grad = single_grad_partition
+        #########################################################################################################
+        # 至此我们获得了两个 两个optimizer self.remote_optimizer_param_groups slef.local_optimizer_param_groups
+        #########################################################################################################
 
         self.reduce_bucket_size = int(reduce_bucket_size)
         self.use_multi_rank_bucket_allreduce = use_multi_rank_bucket_allreduce
@@ -440,7 +502,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         # map between param_id and bool to specify if a param is in this partition
         self.is_param_in_current_partition = {}
-
+        #########################################################################################################
+        self.is_zoetic_in_current_partition = {} # 用于确定remote checkpoint  local param origin
+        #########################################################################################################
         self.grads_in_ipg_bucket = []
         self.params_in_ipg_bucket = []
         self.elements_in_ipg_bucket = 0
@@ -472,7 +536,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         for param_group in self.params_not_in_partition:
             for param in param_group:
                 self.is_param_in_current_partition[self.get_param_id(param)] = False
+        ############################################################################
+        for param_group in self.zoetic_in_partition:
+            for param in param_group:
+                self.is_zoetic_in_current_partition[self.get_param_id(param)] = True
 
+        for param_group in self.zoetic_not_in_partition:
+            for param in param_group:
+                self.is_zoetic_in_current_partition[self.get_param_id(param)] = False
+        ############################################################################
         if self.cpu_offload:
             self.accumulated_grads_in_cpu = {}
             self.norm_for_param_grads = {}
@@ -562,6 +634,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self._enable_universal_checkpoint()
         self._param_slice_mappings = self._create_param_mapping()
         
+        ######################################################################################################
         #zoetic
         self.zoetic_FLAG = False
 
@@ -580,7 +653,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.vertin_Create_FLAG = False
         self.vertin_param_groups = []
 
-        self.vertin_thread = None
+        # self.vertin_thread = None
         # self.vertin_process = None
 
         self.vertin_pool = ProcessPoolExecutor(1)
@@ -588,9 +661,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         self.vertin_update_FLAG = False
 
-        self.grad_position = {}
-        for i, param_group in enumerate(self.bit16_groups):
-            self.get_grad_position(i, self.params_in_partition[i], self.first_offset[i], self.partition_size[i])
+        # self.grad_position = {}
+        # for i, param_group in enumerate(self.bit16_groups):
+        #     self.get_grad_position(i, self.params_in_partition[i], self.first_offset[i], self.partition_size[i])
 
     def destroy(self):
         for i, _ in enumerate(self.optimizer.param_groups):
@@ -2564,7 +2637,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         if load_optimizer_states:
             self._link_all_hp_params()
-
+    ############################################################################################
+    # zoetic vertin
+    ############################################################################################
+    def replica_rank(self, partition_id):
+        if partition_id == 0:
+            return 1
+        elif partition_id == 1:
+            return 0
+        elif partition_id == 2:
+            return 3
+        elif partition_id == 3:
+            return 2
 
 def _handle_overflow(cpu_sum, x, i):
     import math
