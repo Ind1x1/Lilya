@@ -110,6 +110,7 @@ def _pad_tensor_by_size(src_tensor, pad_size, dtype, device):
     return padded_tensor
 
 class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
+
     def __init__(self,
                  init_optimizer,
                  param_names,
@@ -615,7 +616,7 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
         self.dist_local_rank = dist.get_local_rank()
         self.dist_rank = dist.get_rank()
 
-        self.vertin_param_groups = copy.deepcopy(self.optimizer.param_groups)
+        # self.vertin_param_groups = copy.deepcopy(self.optimizer.param_groups)
 
         #zoetic
         self.zoetic_FLAG = False
@@ -1060,6 +1061,5 @@ class ZoeticZeroOptimizer(DeepSpeedZeroOptimizer):
 
         self.timers.log(OPTIMIZER_TIMERS)
         see_memory_usage('After zero_optimizer step')
-        
         return
 

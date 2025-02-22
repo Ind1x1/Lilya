@@ -664,7 +664,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # self.grad_position = {}
         # for i, param_group in enumerate(self.bit16_groups):
         #     self.get_grad_position(i, self.params_in_partition[i], self.first_offset[i], self.partition_size[i])
+        ##################################################################################################################
+        self.zoetic_position = {}
+        self.zoetic_position_remote = {}
+        for i , param_group in enumerate(self.bit16_groups):
+            self.zoetic_get_grad_position(i, self.params_in_partition[i], self.first_offset[i], self.partition_size[i])
 
+        for i , param_group in enumerate(self.bit16_groups):
+            self.zoetic_remote_get_grad_position(i, self.zoetic_in_partition[i], self.zoetic_offset, self.partition_size[i])
+        ##################################################################################################################
     def destroy(self):
         for i, _ in enumerate(self.optimizer.param_groups):
             for p in self.bit16_groups[i]:
@@ -2649,6 +2657,90 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             return 3
         elif partition_id == 3:
             return 2
+        
+    def zoetic_get_grad_position(self, group_id, tensor_list, first_offset, partition_size):
+        current_offset = 0
+
+        for i, tensor in enumerate(tensor_list):
+            param_id = self.get_param_id(tensor)
+            param_start_offset = 0
+
+            num_elements = tensor.numel()
+
+            # we need to offset to get to the right element
+            if i == 0 and first_offset > 0:
+                tensor_offset = first_offset
+                num_elements = num_elements - tensor_offset
+                param_start_offset = first_offset
+
+            # we dont need all elements of the tensor
+            if num_elements > (partition_size - current_offset):
+                num_elements = partition_size - current_offset
+
+            self.zoetic_position[param_id] = [
+                int(group_id), int(param_start_offset),
+                int(current_offset), int(num_elements)
+            ]
+            current_offset += num_elements
+
+    def zoetic_remote_get_grad_position(self, group_id, tensor_list, first_offset, partition_size):
+        current_offset = 0
+
+        for i, tensor in enumerate(tensor_list):
+            param_id = self.get_param_id(tensor)
+            param_start_offset = 0
+
+            num_elements = tensor.numel()
+
+            # we need to offset to get to the right element
+            if i == 0 and first_offset > 0:
+                tensor_offset = first_offset
+                num_elements = num_elements - tensor_offset
+                param_start_offset = first_offset
+
+            # we dont need all elements of the tensor
+            if num_elements > (partition_size - current_offset):
+                num_elements = partition_size - current_offset
+
+            self.zoetic_position_remote[param_id] = [
+                int(group_id), int(param_start_offset),
+                int(current_offset), int(num_elements)
+            ]
+            current_offset += num_elements
+
+    def zoetic_local_async_inplace_copy_grad_to_fp32_buffer_from_gpu(self, param):
+        param_id = self.get_param_id(param)
+
+        [i, source_offset, dest_offset, num_elements] = self.zoetic_position[param_id]
+        
+        dest_tensor = self.local_optimizer_param_groups[i]['params'][0].grad.view(-1).narrow(0, dest_offset, num_elements)
+
+        grad_accum = self.get_param_gradient_attribute(param)
+        if grad_accum is None:
+            src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
+        else:
+            src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
+        if not self.fp16_master_weights_and_gradients:
+            src_tensor = src_tensor.float()
+
+        dest_tensor.copy_(src_tensor, non_blocking=True)
+
+    def zoetic_remote_async_inplace_copy_grad_to_fp32_buffer_from_gpu(self, param):
+        param_id = self.get_param_id(param)
+
+        [i, source_offset, dest_offset, num_elements] = self.zoetic_position_remote[param_id]
+        
+        dest_tensor = self.remote_optimizer_param_groups[i]['params'][0].grad.view(-1).narrow(0, dest_offset, num_elements)
+
+        grad_accum = self.get_param_gradient_attribute(param)
+        if grad_accum is None:
+            src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
+        else:
+            src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
+        if not self.fp16_master_weights_and_gradients:
+            src_tensor = src_tensor.float()
+
+        dest_tensor.copy_(src_tensor, non_blocking=True)
 
 def _handle_overflow(cpu_sum, x, i):
     import math
