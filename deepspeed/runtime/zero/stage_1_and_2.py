@@ -464,6 +464,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.local_optimizer_param_groups = copy.deepcopy(self.optimizer.param_groups)
         for i, param_group in enumerate(self.local_optimizer_param_groups):
             param_group['params'] = [param.detach().clone().cpu().share_memory_() for param in param_group['params']]
+            self.zoetic_partition_of_fp32_groups_local[i] = param_group['params'][0]
             for tensor in param_group['params']:
                 tensor.requires_grad = True
             if 'bias_correction' not in param_group:
@@ -643,11 +644,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.zoetic_offset = 0
         self.zoetic_numel = 0
 
+        self.zoetic_stream = None if get_accelerator().is_synchronized_device() else get_accelerator().Stream()
+
         #TODO vertin
         self.vertin_FLAG = False
         self.vertin_step = 0
 
-        self.vertin_stream = None if get_accelerator().is_synchronized_device() else get_accelerator().Stream()
+        # self.vertin_stream = None if get_accelerator().is_synchronized_device() else get_accelerator().Stream()
 
         self.vertin_optimizer = vertin_cpu_optimizer
         self.vertin_Create_FLAG = False
@@ -656,7 +659,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # self.vertin_thread = None
         # self.vertin_process = None
 
-        self.vertin_pool = ProcessPoolExecutor(1)
+        self.vertin_pool = ProcessPoolExecutor(2)
         self.vertin_lock = mp.Lock()
 
         self.vertin_update_FLAG = False
@@ -665,6 +668,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # for i, param_group in enumerate(self.bit16_groups):
         #     self.get_grad_position(i, self.params_in_partition[i], self.first_offset[i], self.partition_size[i])
         ##################################################################################################################
+        self.zoetic_accumulated_grads_in_cpu_local = {}
+        self.zoetic_accumulated_grads_in_cpu_remote = {}
+
         self.zoetic_position = {}
         self.zoetic_position_remote = {}
         for i , param_group in enumerate(self.bit16_groups):
@@ -673,6 +679,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         for i , param_group in enumerate(self.bit16_groups):
             self.zoetic_remote_get_grad_position(i, self.zoetic_in_partition[i], self.zoetic_offset, self.partition_size[i])
         ##################################################################################################################
+
     def destroy(self):
         for i, _ in enumerate(self.optimizer.param_groups):
             for p in self.bit16_groups[i]:
@@ -1521,6 +1528,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         #         end_time = time.time()
         #         # logger.info(f"copy time = {end_time-start_time}")
 
+        if self.zoetic_FLAG:
+            stream = self.zoetic_stream
+            with get_accelerator().stream(stream):    
+                self.zoetic_local_async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
+
     def reduce_ipg_grads(self):
         if self.contiguous_gradients:
             if self.extra_large_param_to_reduce is not None:
@@ -1572,6 +1584,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 else:  # zero stage 1 - partition only optimizer state
                     if self.contiguous_gradients and self.is_param_in_current_partition[param_id]:
                         self.copy_grads_in_partition(param)
+                    elif self.is_zoetic_in_current_partition[param_id]:
+                        self.zoetic_copy_grads_in_partition(param)
 
         self.grads_in_ipg_bucket = []
         self.params_in_ipg_bucket = []
@@ -2005,6 +2019,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         step_time = time.time() - start_time
         # logger.info(f"overhead = {step_time}")
 
+    def _zoetic_step(self, group_no, flag = True):
+        if flag :
+            original_param_groups = self.local_optimizer_param_groups
+            self.vertin_optimizer.param_groups = [original_param_groups[group_no]]
+            self.vertin_optimizer.step()
+            self.vertin_optimizer.param_groups = original_param_groups
+        else:
+            original_param_groups = self.remote_optimizer_param_groups
+            self.vertin_optimizer.param_groups = [original_param_groups[group_no]]
+            self.vertin_optimizer.step()
+            self.vertin_optimizer.param_groups = original_param_groups
+
     #TODO vertin use the vertin optimizer replace the gpu optimizer
     def vertin_update(self, group_no):
         vertin_state = self.vertin_optimizer.state
@@ -2037,6 +2063,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # else:
         #     self.vertin_pool.submit(self._vertin_step, group_no)
 
+        if self.zoetic_FLAG:
+            self.vertin_pool.submit(self._zoetic_step, group_no, False)
+            self.vertin_pool.submit(self._zoetic_step, group_no, True)
 
         self.optimizer.step()
         self.optimizer.param_groups = original_param_groups
@@ -2741,6 +2770,61 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             src_tensor = src_tensor.float()
 
         dest_tensor.copy_(src_tensor, non_blocking=True)
+
+    # ACCMULATE GRAD 
+    # def zoetic_async_accumulate_grad_in_cpu_via_gpu_local(self, param):
+    #     param_id = self.get_param_id(param)
+
+    #     [i, source_offset, dest_offset, num_elements] = self.grad_position[param_id]
+
+    #     # copy to a preexisiting buffer to avoid memory allocation penalty
+    #     dest_buffer = self.temp_grad_buffer_for_gpu_offload.view(-1).narrow(0, 0, param.numel())
+
+    #     #buffer for storing gradients for this parameter in CPU
+    #     def buffer_to_accumulate_to_in_cpu():
+    #         if not self.fp16_master_weights_and_gradients:
+    #             buffer = torch.zeros(param.numel(), dtype=param.dtype, device=self.device)
+    #             return get_accelerator().pin_memory(buffer) if self.cpu_offload_pin_memory else buffer
+    #         else:
+    #             return self.single_partition_of_fp32_groups[i].grad.view(-1).narrow(0, dest_offset, num_elements)
+
+    #     #accumulate gradients into param.grad_accum or parts of it that belongs to this partition
+    #     def accumulate_gradients():
+    #         grad_accum = self.get_param_gradient_attribute(param)
+    #         if not self.fp16_master_weights_and_gradients:
+    #             dest_buffer.copy_(self.accumulated_grads_in_cpu[param_id].view(-1), non_blocking=True)
+    #             grad_accum.data.view(-1).add_(dest_buffer)
+    #         else:
+    #             dest_buffer.narrow(0, source_offset,
+    #                                num_elements).copy_(self.accumulated_grads_in_cpu[param_id].view(-1),
+    #                                                    non_blocking=True)
+    #             grad_accum.data.view(-1).narrow(0, source_offset,
+    #                                             num_elements).add_(dest_buffer.narrow(0, source_offset, num_elements))
+
+    #     #move accumulated gradients back to CPU
+    #     def copy_gradients_to_cpu():
+    #         grad_accum = self.get_param_gradient_attribute(param)
+    #         if not self.fp16_master_weights_and_gradients:
+    #             self.accumulated_grads_in_cpu[param_id].data.copy_(grad_accum.data.view(-1), non_blocking=True)
+    #         else:
+    #             self.accumulated_grads_in_cpu[param_id].data.copy_(grad_accum.data.view(-1).narrow(
+    #                 0, source_offset, num_elements),non_blocking=True)
+
+    #     if param_id not in self.accumulated_grads_in_cpu:
+    #         self.accumulated_grads_in_cpu[param_id] = buffer_to_accumulate_to_in_cpu()
+
+    #     if self.micro_step_id > 0:
+    #         accumulate_gradients()
+    #     else:
+    #         copy_gradients_to_cpu()
+
+    def zoetic_copy_grads_in_partition(self, param):
+        if self.zoetic_FLAG:
+            stream = self.zoetic_stream
+            with get_accelerator().stream(stream):    
+                self.zoetic_remote_async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
+                if self.partition_gradients:
+                    self.clear_grad_attribute(param)
 
 def _handle_overflow(cpu_sum, x, i):
     import math
