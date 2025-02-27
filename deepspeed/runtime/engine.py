@@ -1319,10 +1319,12 @@ class DeepSpeedEngine(Module):
         if optimizer_wrapper == ZERO_OPTIMIZATION:
             #TODO vertin
             # if self.vertin_flag == True:
-            vertin_optimizer = self._configure_vertin_optimizer(model_parameters)
-            self.vertin_optimizer = vertin_optimizer
+            # vertin_optimizer = self._configure_vertin_optimizer(model_parameters)
+            # self.vertin_optimizer = vertin_optimizer
 
-            self.optimizer = self._configure_zero_optimizer(basic_optimizer, vertin_optimizer)
+            # self.optimizer = self._configure_zero_optimizer(basic_optimizer, vertin_optimizer)
+            self.optimizer = self._configure_zero_optimizer(basic_optimizer)
+            
         elif optimizer_wrapper == AMP:
             amp_params = self.amp_params()
             log_dist(f"Initializing AMP with these params: {amp_params}", ranks=[0])

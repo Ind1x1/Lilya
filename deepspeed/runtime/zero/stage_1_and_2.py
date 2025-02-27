@@ -256,7 +256,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.bit16_groups_flat = []
         
         #######################################################################################
-        self.zoetic_partition_of_fp32_groups = []
+        self.zoetic_partition_of_fp32_groups_remote = []
         self.zoetic_partition_of_fp32_groups_local = []
         #######################################################################################
 
@@ -280,13 +280,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.zoetic_in_partition = []
 
         self.zoetic_not_in_partition = []
+
+        self.zoetic_first_offset = []
         #######################################################################################
 
         # Offset from the first parameter in the self.params_in_partition
         # the parameter boundaries may not align with partition boundaries
         # so we need to keep track of the offset
         self.first_offset = []
-        self.zoetic_offset = []
 
         # number of elements per partition in each group
         self.partition_size = []
@@ -428,8 +429,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             else:
                 checkpoint_partition = self.parallel_partitioned_bit16_groups[i][checkpoint_id].clone().float().detach().cpu().share_memory_()
 
-            self.zoetic_partition_of_fp32_groups.append(checkpoint_partition)
-            self.zoetic_partition_of_fp32_groups[
+            self.zoetic_partition_of_fp32_groups_remote.append(checkpoint_partition)
+            self.zoetic_partition_of_fp32_groups_remote[
                 i].requires_grad = True  # keep this in case internal optimizer uses it            
             ##########################################################################
 
@@ -449,7 +450,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             params_in_partition, params_not_in_partition, first_offset = self.get_partition_info(
                 self.round_robin_bit16_groups[i], partition_size, partition_id)
             ########################################################################## 1 repblica
-            zoetic_remote_partition,zoetic_not_in_partition,zoetic_offset = self.get_partition_info(self.round_robin_bit16_groups[i], partition_size, partition_id)
+            zoetic_remote_partition,zoetic_not_in_partition,zoetic_offset = self.get_partition_info(self.round_robin_bit16_groups[i], partition_size, checkpoint_id)
             self.zoetic_in_partition.append(zoetic_remote_partition)
             self.zoetic_first_offset.append(zoetic_offset)
             self.zoetic_not_in_partition.append(zoetic_not_in_partition)
@@ -459,34 +460,44 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.params_not_in_partition.append(params_not_in_partition)
             self.first_offset.append(first_offset)
 
+        self.zoetic_local_grad_list = []
+        self.zoetic_remote_grad_list = []
         #########################################################################################################
         # local replica
         self.local_optimizer_param_groups = copy.deepcopy(self.optimizer.param_groups)
         for i, param_group in enumerate(self.local_optimizer_param_groups):
             param_group['params'] = [param.detach().clone().cpu().share_memory_() for param in param_group['params']]
-            self.zoetic_partition_of_fp32_groups_local[i] = param_group['params'][0]
+            self.zoetic_partition_of_fp32_groups_local.append(param_group['params'][0])
             for tensor in param_group['params']:
                 tensor.requires_grad = True
             if 'bias_correction' not in param_group:
                 param_group['bias_correction'] = True
         for i, param_group in enumerate(self.local_optimizer_param_groups):
             for param in param_group['params']:
+                grad_list = []
                 single_grad_partition = torch.zeros(int(param.numel()),
                                                     dtype = self.single_partition_of_fp32_groups[i].dtype,
                                                     device = 'cpu')
                 single_grad_partition.share_memory_()
                 param.grad = single_grad_partition
+                grad_list.append(single_grad_partition)
+            self.zoetic_local_grad_list.append(grad_list)
         #########################################################################################################
         self.remote_optimizer_param_groups = copy.deepcopy(self.optimizer.param_groups)
         for i, param_group in enumerate(self.remote_optimizer_param_groups):
-             param_group['params'] = [self.zoetic_partition_of_fp32_groups[i]]
+            param_group['params'] = [self.zoetic_partition_of_fp32_groups_remote[i]]
+            if 'bias_correction' not in param_group:
+                param_group['bias_correction'] = True
         for i, param_group in enumerate(self.remote_optimizer_param_groups):
             for param in param_group['params']:
+                grad_list = []
                 single_grad_partition = torch.zeros(int(param.numel()),
-                                                    dtype = self.zoetic_partition_of_fp32_groups[i].dtype,
+                                                    dtype = self.zoetic_partition_of_fp32_groups_remote[i].dtype,
                                                     device = 'cpu')
                 single_grad_partition.share_memory_()
                 param.grad = single_grad_partition
+                grad_list.append(single_grad_partition)
+            self.zoetic_remote_grad_list.append(grad_list)
         #########################################################################################################
         # 至此我们获得了两个 两个optimizer self.remote_optimizer_param_groups slef.local_optimizer_param_groups
         #########################################################################################################
@@ -659,9 +670,21 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # self.vertin_thread = None
         # self.vertin_process = None
 
-        self.vertin_pool = ProcessPoolExecutor(2)
-        self.vertin_lock = mp.Lock()
+        # self.vertin_pool = ProcessPoolExecutor(2)
+        # self.vertin_lock = mp.Lock()
 
+        mp.set_start_method('spawn')
+        
+        #################################################################################################################
+        if self.zoetic_FLAG :
+            self.zoetic_update_flag = mp.Value('b', False)
+            self.zoetic_group_no = mp.Value('i', 0) 
+            self.zoetic_stop_event = mp.Event()
+            self.zoetic_worker_process = ZoeticProcess(self.local_optimizer_param_groups, self.remote_optimizer_param_groups,
+                                                       self.zoetic_local_grad_list, self.zoetic_remote_grad_list,
+                                                       self.zoetic_stop_event,self.zoetic_update_flag,self.zoetic_group_no)
+            self.zoetic_worker_process.start()
+        #################################################################################################################
         self.vertin_update_FLAG = False
 
         # self.grad_position = {}
@@ -677,7 +700,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.zoetic_get_grad_position(i, self.params_in_partition[i], self.first_offset[i], self.partition_size[i])
 
         for i , param_group in enumerate(self.bit16_groups):
-            self.zoetic_remote_get_grad_position(i, self.zoetic_in_partition[i], self.zoetic_offset, self.partition_size[i])
+            self.zoetic_remote_get_grad_position(i, self.zoetic_in_partition[i], self.zoetic_first_offset[i], self.partition_size[i])
         ##################################################################################################################
 
     def destroy(self):
@@ -1139,8 +1162,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         process_group = self.dp_process_group if process_group is None else process_group
         allreduced = self.allreduce_bucket(small_bucket, log=log, divide=divide, process_group=process_group)
         for buf, synced, bucket_rank in zip(small_bucket, self.unflatten(allreduced, small_bucket), bucket_ranks):
-            if dist.get_rank(group=process_group) == bucket_rank:
+            if self.zoetic_FLAG:
                 buf.copy_(synced)
+            else:
+                if dist.get_rank(group=process_group) == bucket_rank:
+                    buf.copy_(synced)
 
     def allreduce_and_scatter(self, bucket, numel_per_bucket=500000000, log=None, divide=True, process_group=None):
         small_bucket = []
@@ -1584,7 +1610,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 else:  # zero stage 1 - partition only optimizer state
                     if self.contiguous_gradients and self.is_param_in_current_partition[param_id]:
                         self.copy_grads_in_partition(param)
-                    elif self.is_zoetic_in_current_partition[param_id]:
+                    if self.is_zoetic_in_current_partition[param_id]:
                         self.zoetic_copy_grads_in_partition(param)
 
         self.grads_in_ipg_bucket = []
@@ -2020,16 +2046,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # logger.info(f"overhead = {step_time}")
 
     def _zoetic_step(self, group_no, flag = True):
-        if flag :
-            original_param_groups = self.local_optimizer_param_groups
-            self.vertin_optimizer.param_groups = [original_param_groups[group_no]]
-            self.vertin_optimizer.step()
-            self.vertin_optimizer.param_groups = original_param_groups
-        else:
-            original_param_groups = self.remote_optimizer_param_groups
-            self.vertin_optimizer.param_groups = [original_param_groups[group_no]]
-            self.vertin_optimizer.step()
-            self.vertin_optimizer.param_groups = original_param_groups
+        original_param_groups = self.local_optimizer_param_groups
+        self.vertin_optimizer.param_groups = [original_param_groups[group_no]]
+        self.vertin_optimizer.step()
+        self.vertin_optimizer.param_groups = original_param_groups
+        original_param_groups = self.remote_optimizer_param_groups
+        self.vertin_optimizer.param_groups = [original_param_groups[group_no]]
+        self.vertin_optimizer.step()
+        self.vertin_optimizer.param_groups = original_param_groups
 
     #TODO vertin use the vertin optimizer replace the gpu optimizer
     def vertin_update(self, group_no):
@@ -2063,9 +2087,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # else:
         #     self.vertin_pool.submit(self._vertin_step, group_no)
 
-        if self.zoetic_FLAG:
-            self.vertin_pool.submit(self._zoetic_step, group_no, False)
-            self.vertin_pool.submit(self._zoetic_step, group_no, True)
+        # if self.zoetic_FLAG:
+        #     self.vertin_pool.submit(self._zoetic_step, group_no)
 
         self.optimizer.step()
         self.optimizer.param_groups = original_param_groups
@@ -2108,8 +2131,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self._global_grad_norm = scaled_global_grad_norm / prev_scale
         see_memory_usage('After norm before optimizer')
 
+        #####
+        zoetic_update_no = -1
+        #####
         # Step 2:- run optimizer and upscaling simultaneously
         for i, group in enumerate(self.bit16_groups):
+            zoetic_update_no += 1
             self.timers(OPTIMIZER_GRADIENTS_TIMER).start()
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
             if self.cpu_offload:
@@ -2169,7 +2196,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 fp32_partition = self.single_partition_of_fp32_groups[i]
                 bit16_partitions[partition_id].data.copy_(fp32_partition.data)
                 self.timers(OPTIMIZER_STEP_TIMER).stop()
+        
 
+        ##############################################
+        self.zoetic_update_flag.value = True
+        self.zoetic_group_no.value = zoetic_update_no
+        ##############################################
+        
         see_memory_usage('After optimizer before all-gather')
         if self.cpu_offload:
             self.reset_cpu_buffers()
@@ -2937,3 +2970,52 @@ def estimate_zero2_model_states_mem_needs_all_cold(total_params,
 
         options_str = format_options(cpu_offload=cpu_offload)
         print(f" {cpu_mem/2**30:7.2f}GB | {gpu_mem/2**30:6.2f}GB | {options_str}")
+
+
+class ZoeticProcess(mp.Process):
+    def __init__(self, param_local,param_remote,grad_list_local, grad_list_remote, stop_event, update_flag, update_group_no):
+        super().__init__()
+
+        self.local_optimizer_param_groups = param_local
+        self.remote_optimizer_param_groups = param_remote
+
+        self.local_optimizer_param_groups_grad = grad_list_local
+        self.remote_optimizer_param_groups_grad = grad_list_remote
+
+        self.link_param_grad(self.local_optimizer_param_groups, self.local_optimizer_param_groups_grad)
+        self.link_param_grad(self.remote_optimizer_param_groups, self.remote_optimizer_param_groups_grad)
+
+        self.stop_event = stop_event
+        self.update_flag = update_flag
+        self.update_group_no = update_group_no
+
+        from deepspeed.ops.vertin import SonnetVertinCPUAdam
+        self.vertin_optimizer = SonnetVertinCPUAdam(self.local_optimizer_param_groups)
+
+    def link_param_grad(self, param_groups, grad_groups):
+        for i, param_group in enumerate(param_groups):
+            for j, param in enumerate(param_group['params']):
+                param.grad = grad_groups[i][j]   
+
+    def Zoetic_update(self):
+        while not self.stop_event.is_set():
+            if self.update_flag.value:
+                id = self.update_group_no.value
+                self._step(id)
+                self.update_flag.value = False
+                self.update_group_no.value = 0
+            time.sleep(0.5)
+
+    def _step(self, id):
+        for i in range(id):
+            original_param_groups = self.vertin_optimizer.param_groups
+            # local update
+            self.vertin_optimizer.param_groups = [self.local_optimizer_param_groups[i]]
+            self.vertin_optimizer.step()
+            # remote update 
+            self.vertin_optimizer.param_groups = [self.remote_optimizer_param_groups[i]]
+            self.vertin_optimizer.step()
+
+            self.vertin_optimizer.param_groups = original_param_groups
+
+    
