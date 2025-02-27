@@ -677,13 +677,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         
         #################################################################################################################
         if self.zoetic_FLAG :
-            self.zoetic_update_flag = mp.Value('b', False)
+            # mp.set_start_method('spawn')
+            self.zoetic_local_lock = mp.Lock()
+            self.zoetic_remote_lock = mp.Lock()
+            self.zoetic_update_flag = mp.Condition()
             self.zoetic_group_no = mp.Value('i', 0) 
             self.zoetic_stop_event = mp.Event()
-            self.zoetic_worker_process = ZoeticProcess(self.local_optimizer_param_groups, self.remote_optimizer_param_groups,
-                                                       self.zoetic_local_grad_list, self.zoetic_remote_grad_list,
-                                                       self.zoetic_stop_event,self.zoetic_update_flag,self.zoetic_group_no)
-            self.zoetic_worker_process.start()
+            # self.zoetic_worker_process = ZoeticProcess(self.local_optimizer_param_groups, self.remote_optimizer_param_groups,
+            #                                            self.zoetic_local_grad_list, self.zoetic_remote_grad_list,
+            #                                            self.zoetic_stop_event,self.zoetic_update_flag,self.zoetic_group_no, 
+            #                                            self.zoetic_remote_lock, self.zoetic_local_lock)
+           
+            # self.zoetic_worker_process.start()
         #################################################################################################################
         self.vertin_update_FLAG = False
 
@@ -2199,10 +2204,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         
 
         ##############################################
-        self.zoetic_update_flag.value = True
-        self.zoetic_group_no.value = zoetic_update_no
+        if self.zoetic_FLAG:
+            self.zoetic_update_flag.value = True
+            self.zoetic_group_no.value = zoetic_update_no
         ##############################################
-        
+
         see_memory_usage('After optimizer before all-gather')
         if self.cpu_offload:
             self.reset_cpu_buffers()
@@ -2972,50 +2978,67 @@ def estimate_zero2_model_states_mem_needs_all_cold(total_params,
         print(f" {cpu_mem/2**30:7.2f}GB | {gpu_mem/2**30:6.2f}GB | {options_str}")
 
 
-class ZoeticProcess(mp.Process):
-    def __init__(self, param_local,param_remote,grad_list_local, grad_list_remote, stop_event, update_flag, update_group_no):
-        super().__init__()
+# class ZoeticProcess(mp.Process):
+#     def __init__(self, param_local,param_remote,grad_list_local, grad_list_remote, stop_event, update_flag, update_group_no, remote_lock,local_lock):
+#         super().__init__()
 
-        self.local_optimizer_param_groups = param_local
-        self.remote_optimizer_param_groups = param_remote
+#         self.local_optimizer_param_groups = param_local
+#         self.remote_optimizer_param_groups = param_remote
 
-        self.local_optimizer_param_groups_grad = grad_list_local
-        self.remote_optimizer_param_groups_grad = grad_list_remote
+#         self.local_optimizer_param_groups_grad = grad_list_local
+#         self.remote_optimizer_param_groups_grad = grad_list_remote
+#         self.remote_lock = remote_lock
+#         self.local_lock = local_lock
 
-        self.link_param_grad(self.local_optimizer_param_groups, self.local_optimizer_param_groups_grad)
-        self.link_param_grad(self.remote_optimizer_param_groups, self.remote_optimizer_param_groups_grad)
+#         # self.link_param_grad(self.local_optimizer_param_groups, self.local_optimizer_param_groups_grad)
+#         # self.link_param_grad(self.remote_optimizer_param_groups, self.remote_optimizer_param_groups_grad)
 
-        self.stop_event = stop_event
-        self.update_flag = update_flag
-        self.update_group_no = update_group_no
+#         self.stop_event = stop_event
+#         self.update_flag = update_flag
+#         self.update_group_no = update_group_no
+#         from deepspeed.ops.vertin import SonnetVertinCPUAdam
+#         self.vertin_optimizer = SonnetVertinCPUAdam(self.local_optimizer_param_groups)
 
-        from deepspeed.ops.vertin import SonnetVertinCPUAdam
-        self.vertin_optimizer = SonnetVertinCPUAdam(self.local_optimizer_param_groups)
+#         # from deepspeed.ops.adam import DeepSpeedCPUAdam
+#         # self.vertin_optimizer = DeepSpeedCPUAdam(self.local_optimizer_param_groups)
 
-    def link_param_grad(self, param_groups, grad_groups):
-        for i, param_group in enumerate(param_groups):
-            for j, param in enumerate(param_group['params']):
-                param.grad = grad_groups[i][j]   
+#         original_param_groups = self.vertin_optimizer.param_groups
+#         self.vertin_optimizer.param_groups = [self.local_optimizer_param_groups[0]]
+#         print(self.vertin_optimizer.param_groups[0]['params'][0].grad)
+#         self.vertin_optimizer.step()
+#         self.vertin_optimizer.param_groups = original_param_groups
+                    
+#         # 
 
-    def Zoetic_update(self):
-        while not self.stop_event.is_set():
-            if self.update_flag.value:
-                id = self.update_group_no.value
-                self._step(id)
-                self.update_flag.value = False
-                self.update_group_no.value = 0
-            time.sleep(0.5)
+#     def link_param_grad(self, param_groups, grad_groups):
+#         for i, param_group in enumerate(param_groups):
+#             for j, param in enumerate(param_group['params']):
+#                 param.grad = grad_groups[i][j]   
 
-    def _step(self, id):
-        for i in range(id):
-            original_param_groups = self.vertin_optimizer.param_groups
-            # local update
-            self.vertin_optimizer.param_groups = [self.local_optimizer_param_groups[i]]
-            self.vertin_optimizer.step()
-            # remote update 
-            self.vertin_optimizer.param_groups = [self.remote_optimizer_param_groups[i]]
-            self.vertin_optimizer.step()
+#     def run(self):
+#         while not self.stop_event.is_set():
+#             with self.update_flag:
+#                 self.update_flag.wait()
+#                 id = self.update_group_no.value
+#                 with self.local_lock:
+#                     original_param_groups = self.vertin_optimizer.param_groups
+#                     self.vertin_optimizer.param_groups = [self.local_optimizer_param_groups[id]]
+#                     print(self.vertin_optimizer.param_groups[0]['params'][0].grad)
+#                     self.vertin_optimizer.step()
+#                     self.vertin_optimizer.param_groups = original_param_groups
+#                     print(self.vertin_optimizer.state_dict())
+                    
 
-            self.vertin_optimizer.param_groups = original_param_groups
+    # def _step(self, id):
+    #     for i in range(id):
+    #         print(f"run {id}")
+    #         print("run step once ")
+    #         original_param_groups = self.vertin_optimizer.param_groups
+    #         # local update
+    #         self.vertin_optimizer.param_groups = [self.local_optimizer_param_groups[i]]
+    #         self.vertin_optimizer.step()
+    #         # remote update 
+    #         self.vertin_optimizer.param_groups = [self.remote_optimizer_param_groups[i]]
+    #         self.vertin_optimizer.step()
 
-    
+    #         self.vertin_optimizer.param_groups = original_param_groups
