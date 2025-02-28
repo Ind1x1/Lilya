@@ -648,7 +648,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         
         ######################################################################################################
         #zoetic
-        self.zoetic_FLAG = False
+        self.zoetic_FLAG = True
 
         self.zoetic_buffer = None
         self.zoetic_index = 0
@@ -677,7 +677,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         
         #################################################################################################################
         if self.zoetic_FLAG :
-            # mp.set_start_method('spawn')
             self.zoetic_local_lock = mp.Lock()
             self.zoetic_remote_lock = mp.Lock()
             self.zoetic_update_flag = mp.Condition()
@@ -2205,8 +2204,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         ##############################################
         if self.zoetic_FLAG:
-            self.zoetic_update_flag.value = True
-            self.zoetic_group_no.value = zoetic_update_no
+            with self.zoetic_update_flag:
+                self.zoetic_group_no.value = zoetic_update_no
+                self.zoetic_update_flag.notify()
         ##############################################
 
         see_memory_usage('After optimizer before all-gather')

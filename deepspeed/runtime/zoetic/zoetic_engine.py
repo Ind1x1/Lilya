@@ -104,14 +104,19 @@ class ZoeticProcess(mp.Process):
             with self.update_flag:
                 self.update_flag.wait()
                 id = self.update_group_no.value
-                with self.local_lock:
-                    original_param_groups = self.vertin_optimizer.param_groups
-                    self.vertin_optimizer.param_groups = [self.local_optimizer_param_groups[id]]
-                    # print(self.vertin_optimizer.param_groups[0]['params'][0])
-                    self.vertin_optimizer.param_groups[0]['params'][0].grad = self.local_optimizer_param_groups_grad[0][id]
-                    self.vertin_optimizer.step()
-                    self.vertin_optimizer.param_groups = original_param_groups
-                    # print(self.vertin_optimizer.state_dict())
+                for i in range(id):
+                    with self.local_lock:
+                        original_param_groups = self.vertin_optimizer.param_groups
+                        self.vertin_optimizer.param_groups = [self.local_optimizer_param_groups[id]]
+                        # print(self.vertin_optimizer.param_groups[0]['params'][0])
+                        self.vertin_optimizer.param_groups[0]['params'][0].grad = self.local_optimizer_param_groups_grad[0][id]
+                        self.vertin_optimizer.step()
+                    with self.remote_lock:
+                        self.vertin_optimizer.param_groups = [self.remote_optimizer_param_groups[id]]
+                        self.vertin_optimizer.param_groups[0]['params'][0].grad = self.remote_optimizer_param_groups_grad[0][id]
+                        self.vertin_optimizer.step()
+                        # print(self.vertin_optimizer.state_dict())
+                self.vertin_optimizer.param_groups = original_param_groups
 
     # def _step(self, id):
     #     for i in range(id):
