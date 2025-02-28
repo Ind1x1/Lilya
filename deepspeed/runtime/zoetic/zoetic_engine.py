@@ -87,8 +87,8 @@ class ZoeticProcess(mp.Process):
         self.stop_event = stop_event
         self.update_flag = update_flag
         self.update_group_no = update_group_no
-        from deepspeed.ops.vertin import SonnetVertinCPUAdam
-        self.vertin_optimizer = SonnetVertinCPUAdam(self.local_optimizer_param_groups)    
+
+        self.create_flag = False   
     
     def link_param_grad(self, param_groups, grad_groups):
         for i, param_group in enumerate(param_groups):
@@ -97,17 +97,22 @@ class ZoeticProcess(mp.Process):
 
     def run(self):
         while not self.stop_event.is_set():
+            if not self.create_flag:
+                from deepspeed.ops.vertin import SonnetVertinCPUAdam
+                self.vertin_optimizer = SonnetVertinCPUAdam(self.local_optimizer_param_groups) 
+                self.create_flag = True
             with self.update_flag:
                 self.update_flag.wait()
                 id = self.update_group_no.value
                 with self.local_lock:
                     original_param_groups = self.vertin_optimizer.param_groups
                     self.vertin_optimizer.param_groups = [self.local_optimizer_param_groups[id]]
-                    print(self.vertin_optimizer.param_groups[0]['params'][0].grad)
+                    # print(self.vertin_optimizer.param_groups[0]['params'][0])
+                    self.vertin_optimizer.param_groups[0]['params'][0].grad = self.local_optimizer_param_groups_grad[0][id]
                     self.vertin_optimizer.step()
                     self.vertin_optimizer.param_groups = original_param_groups
-                    print(self.vertin_optimizer.state_dict())
-                    
+                    # print(self.vertin_optimizer.state_dict())
+
     # def _step(self, id):
     #     for i in range(id):
     #         print(f"run {id}")
